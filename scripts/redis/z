@@ -1,0 +1,467 @@
+<?php
+//by liuqingjun@baidu
+/*
+   config
+          */
+$tmppath = dirname(__FILE__).'/zkvar';
+$defhost = '10.46.135.27:2181,10.46.135.28:2181';
+//online host = 10.23.253.43:8181
+
+
+/*
+ * dump an object to a file, the object will be serialized automatically
+ * $var is the object to be dumped
+ *
+ * this function is thread safe
+ */
+function dump_to_file($var, $filename, $path) {
+    $file = $path . '/' . $filename;
+    $fd = fopen($file, 'a+b');
+    if (flock($fd, LOCK_EX)) {
+        ftruncate($fd, 0);
+        fwrite($fd, serialize($var));
+        flock($fd, LOCK_UN);
+
+        fclose($fd);
+        return true;
+    } else {
+        //could not get lock
+        fclose($fd);
+        return false;
+    }
+}
+
+/*
+ * retrieve previously dumped object from a file
+ * $filename = filename specified in dump_to_file
+ *
+ * this function is thread safe
+ */
+function retrieve_from_file($filename, $path) {
+    $file = $path . '/' . $filename;
+    if (!file_exists($file)) {
+        return null;
+    }
+    $fd = fopen($file, 'rb');
+    if (flock($fd, LOCK_SH)) {
+        $data = fread($fd, filesize($file));
+        $var = unserialize($data);
+        flock($fd, LOCK_UN);
+
+        fclose($fd);
+        return $var;
+    } else {
+        //could not get lock
+        fclose($fd);
+        return null;
+    }
+}
+function _gpp() {
+    $p = getenv('ZK_PPID');
+    if(empty($p)) $p = posix_getppid();
+    return $p;
+}
+function _set_data($host, $curpath) {
+    global $tmppath, $defhost;
+    if(empty($host)) $host = $defhost;
+    $curpath = explode('/', $curpath);
+    $new_path = array();
+    foreach($curpath as $v) {
+        if(!empty($v)){
+            if($v == '..') {
+                array_pop($new_path);
+            } else if ($v == '.') {
+            } else {
+                $new_path[] = $v;
+            }
+        }
+    }
+    
+    $d = array('h'=>$host, 'p'=>$new_path, 't'=>gettimeofday(true));
+    dump_to_file($d, 'zktmp-'._gpp(), $tmppath);
+}
+function _get_host() {
+    global $tmppath;
+    $d = retrieve_from_file('zktmp-'._gpp(), $tmppath);
+    $curtime = gettimeofday(true);
+    if(empty($d)) return null;
+    if($curtime - $d['t'] > 86400) return null;
+    return $d['h'];
+}
+function _get_path($tgt) {
+    global $tmppath;
+    $d = retrieve_from_file('zktmp-'._gpp(), $tmppath);
+    $curtime = gettimeofday(true);
+    if(empty($d)) return null;
+    if($curtime - $d['t'] > 86400) return null;
+
+    $cur_path = $d['p'];//array('baidu');
+    if($tgt[0] == '/') {
+        $new_path = array();
+    } else {
+        $new_path = $cur_path;
+    }
+    $tgt = explode("/", $tgt);
+    foreach($tgt as $v) {
+        if(!empty($v)){
+            if($v == '..') {
+                array_pop($new_path);
+            } else if ($v == '.') {
+            } else {
+                $new_path[] = $v;
+            }
+        }
+    }
+    //construct path
+    if(empty($new_path)) return '/';
+    $p = '';
+    foreach($new_path as $v) {
+        $p .= '/'.$v;
+    }
+    return $p;
+}
+function _init() {
+    global $z;
+    global $tmppath;
+    $d = retrieve_from_file('zktmp-'._gpp(), $tmppath);
+    $curtime = gettimeofday(true);
+    if(empty($d)) return false;
+    if($curtime - $d['t'] > 86400) return false;
+
+    $z = new zookeeper($d['h']);
+    return true;
+}
+function _get_default_acl() {
+    return array(array (
+        'perms' => 31,
+        'scheme' => 'world',
+        'id' => 'anyone',
+    ));
+}
+function _set_acl_test($path) {
+    $acl = array(
+        array(
+            "perms" => 31,
+            "scheme"=> "ip",
+            "id"=> "10.32.54.38",
+        ),
+        array(
+          "perms"=> 1,
+          "scheme"=> "world",
+          "id"=> "anyone",
+        ),
+    );
+    global $z;
+    var_dump($z->setAcl($path, 0, $acl));
+}
+function zkgetacl($path) {
+    global $z;
+    $acl = $z->getAcl(_get_path($path));
+    var_dump($acl);
+}
+function _get_parent_acl($path) {
+    global $z;
+    $parent_path = substr($path, 0, strrpos($path, '/'));
+    $acl = $z->getAcl($parent_path);
+    return $acl;
+}
+function _zkcopy($from, $to) {
+    if ($from == '/' || $to == '/') {
+        echo "cannot operate on root!!\n";
+        exit();
+    }
+    global $z;
+    $val = $z->get($from);
+    $acl = $z->getAcl($from);
+    $z->create($to, $val, $acl[1]);
+    echo "$from -> $to\n";
+    $cld = $z->getChildren($from);
+    foreach($cld as $v) {
+        _zkcopy($from.'/'.$v, $to.'/'.$v);
+    }
+}
+function _zkrmrf($tgt) {
+    if ($tgt == '/') {
+        echo "cannot delete root!!\n";
+        exit();
+    }
+    global $z;
+    $cld = $z->getChildren($tgt);
+    foreach($cld as $v) {
+        _zkrmrf($tgt.'/'.$v);
+    }
+    echo "delete $tgt\n";
+    $z->delete($tgt);
+}
+function zkcheck() {
+    global $tmppath;
+    $msg = '';
+    $_c = array(
+        'LIGHT_RED'         => chr(27)."[1;31m",
+        'LIGHT_GREEN'       => chr(27)."[1;32m",
+        'YELLOW'            => chr(27)."[1;33m",
+        'LIGHT_BLUE'        => chr(27)."[1;34m",
+        'MAGENTA'           => chr(27)."[1;35m",
+        'LIGHT_CYAN'        => chr(27)."[1;36m",
+        'WHITE'             => chr(27)."[1;37m",
+        'NORMAL'            => chr(27)."[0m",
+        'BLACK'             => chr(27)."[0;30m",
+        'RED'               => chr(27)."[0;31m",
+        'GREEN'             => chr(27)."[0;32m",
+        'BROWN'             => chr(27)."[0;33m",
+        'BLUE'              => chr(27)."[0;34m",
+        'CYAN'              => chr(27)."[0;36m",
+        'BOLD'              => chr(27)."[1m",
+        'UNDERSCORE'        => chr(27)."[4m",
+        'REVERSE'           => chr(27)."[7m",
+    );
+    //check for zookeeper
+    $ok  = $_c['GREEN']."[OK]".$_c['NORMAL']."\n";
+    $fail = $_c['RED']."[FAILED]".$_c['NORMAL']."\n";
+    echo "Checking for zookeeper extension... ";
+    if (class_exists('zookeeper')) {
+        echo $ok;
+    } else {
+        echo $fail;
+        $msg .= "Please install Zookeeper extension for PHP\n";
+    }
+
+    //check for zkvar dir
+    echo "Checking for temp directory... ";
+    if (is_dir($tmppath)) {
+        echo $ok;
+        $suc = true;
+    } else {
+        //trying to create
+        echo "\nTrying to create temp directory... ";
+        $suc = @mkdir($tmppath);
+        if($suc) {
+            echo $ok;
+        } else {
+            echo $fail;
+            $msg .= "Could not create temporary directory\n";
+        }
+    }
+
+    //check writing temporary data
+    if ($suc) {
+        echo "Trying to write data in temp directory... ";
+        $time = gettimeofday(true);
+        dump_to_file($time, 'test', $tmppath);
+        $s = retrieve_from_file('test', $tmppath);
+        if ($s == $time) {
+            echo $ok;
+        } else {
+            echo $fail;
+            $msg .= "Could not create temporary file, check write permission of $tmppath\n";
+        }
+        @unlink($tmppath.'/test');
+    }
+    if ($msg == '') {
+        $msg = "Check passed, you may use this script now\n";
+    }
+    echo $msg;
+}
+function zksh($host, $port) {
+    global $z, $defhost;
+    if(empty($host)) {
+        $host = $defhost;
+    } else if(!((strpos($host, ':') === false) ^ empty($port))) {
+        echo "param error, port not assigned or assigned twice\n";
+        exit(-1);
+    }
+    if(!empty($port)) {
+        $host = $host.':'.$port;
+    }
+    $z = new zookeeper($host);
+    _set_data($host, '/');
+    if($z->get('/') === null) {
+        echo "could not connect to $host\n";
+        exit(-1);
+    }
+}
+function zkcd($tgt) {
+    _set_data(_get_host(), _get_path($tgt));
+}
+function zkls($tgt) {
+    global $z;
+    $cld = $z->getChildren(_get_path($tgt));
+    if (is_array($cld)) {
+        natcasesort($cld);
+        foreach($cld as $v) {
+            echo "$v\n";
+        }
+    } else {
+        echo "node $tgt doesn't exist or could not connect to zookeeper\n";
+        exit(-1);
+    }
+}
+function zkcp($from, $to) {
+    $f = _get_path($from);
+    $t = _get_path($to);
+    _zkcopy($f, $t);
+}
+function zkget($tgt) {
+    global $z;
+    echo $z->get(_get_path($tgt));
+    echo "\n";
+}
+function zkcat($tgt) {
+    zkget($tgt);
+}
+function zkset($tgt, $val) {
+    global $z;
+    if (empty($val)) {
+        $val = file_get_contents('php://stdin');
+    }
+    $val = stripcslashes($val);
+    if (!$z->set(_get_path($tgt), $val)) {
+        echo "failed, maybe $tgt doesn't exist or could not connect to zookeeper\n";
+    }
+}
+function zkrm($tgt) {
+    _zkrmrf(_get_path($tgt));
+}
+function zzkrmrf($tgt) {
+    _zkrmrf(_get_data($tgt));
+}
+function zktouch($tgt, $data = '') {
+    global $z;
+    #$ret = $z->create(_get_path($tgt), $data, _get_default_acl());
+    $parent_acl = _get_parent_acl(_get_path($tgt));
+    $ret = $z->create(_get_path($tgt), $data, $parent_acl[1]);
+    if($ret == null) {
+        echo "failed, see errmsg, or maybe could not connect to zookeeper\n";
+    }
+}
+function zkmkdir($tgt) {
+    zktouch($tgt);
+}
+function zkcreate($tgt, $data = '') {
+    zktouch($tgt, $data);
+}
+function _export($path) {
+    global $z;
+    $data = $z->get($path);
+    $acl = $z->getAcl($path);
+    $cld = $z->getChildren($path);
+    $children = array();
+    foreach($cld as $v) {
+        $children[$v] = _export(_get_path($path.'/'.$v));
+    }
+    return array('data'=>$data, 'acl'=>$acl, 'children'=>$children);
+}
+function zkexport($tgt) {
+    echo "<?php\nreturn ";
+    var_export(_export(_get_path($tgt)));
+    echo ";";
+}
+function _import($tgt, $data) {
+    global $z;
+    $val = $data['data'];
+    $acl = $data['acl'];
+    $cld = $data['children'];
+    $z->create($tgt, $val, $acl[1]);
+    echo "created $tgt\n";
+    foreach($cld as $k => $v) {
+        _import(_get_path($tgt.'/'.$k), $v);
+    }
+}
+function zkimport($tgt, $file) {
+    if(!file_exists($file)) {
+        echo "File $file does not exist!\n";
+        exit();
+    }
+    $d = include($file);
+    _import(_get_path($tgt), $d);
+}
+function zkpwd() {
+    echo _get_path()."\n";
+}
+function zkhelp() {
+    echo "Zookeeper Shell\n";
+    echo "Usage: ".basename($GLOBALS['argv'][0])." function params\n";
+    echo "Start a session with ".basename($GLOBALS['argv'][0])." sh [host] [port]\n";
+    //echo "Additionally, run `".basename($GLOBALS['argv'][0])." complete` to enable autocompletion\n";
+    echo "All available functions are:\n";
+    _list_all();
+}
+function _list_all($sep = ', ') {
+    $f = get_defined_functions();
+    $f = $f['user'];
+    $l = false;
+    foreach($f as $v) {
+        if(substr($v,0,2) != 'zk') continue;
+        if($l) echo $sep;
+        $l = true;
+        echo substr($v,2);
+    }
+    echo "\n";
+}
+function run($argv) {
+    $a = @$argv[0];
+    if(empty($a)) {
+        echo "no input argument\n";
+        zkhelp();
+        exit(-1);
+    }
+    if($a == "complete") {
+        $out = '_z() {
+    loc=$COMP_CWORD
+    cur=${COMP_WORDS[$COMP_CWORD]}
+    export ZK_PPID=$PPID
+    if [[ "$loc" == "1" ]]
+    then
+        COMPREPLY=($(compgen -W "$('.$GLOBALS['argv'][0].' listallcommands  | sed -e \'s/.$/& /g\')" $cur))
+    else
+        if [[ $(expr index "$cur" "/") == 0 ]]
+        then
+            b=
+        else
+            b=${cur%/*}
+            c=$b/
+            if [[ -z "$b" ]]
+            then
+                b=/
+            fi
+        fi
+        COMPREPLY=($(compgen -W "$('.$GLOBALS['argv'][0].' ls $b|awk \'{print "\'$c\'" $0 "/"}\')" $cur))
+    fi
+}
+complete -o nospace -F _z '.basename($GLOBALS['argv'][0]).'
+';
+        echo $out;
+        exit();
+
+    }
+    if($a == 'listallcommands') {
+        _list_all(' ');
+        exit(-1);
+    }
+    if($a == 'check') {
+        zkcheck();
+        exit(-1);
+    }
+    $a = 'zk'.$a;
+    if($a == 'zksh') {
+        zksh(@$argv[1], @$argv[2]);
+    } else {
+        if(!_init()) {
+            fprintf(STDERR, "init failed, please start session with '{$GLOBALS['argv'][0]} sh', ppid = "._gpp()."\n");
+            exit(-1);
+        }
+        if(!function_exists($a)) {
+            echo "function {$argv[0]} not found\n";
+            echo "All available functions are:\n";
+            _list_all();
+            exit(-1);
+        } else {
+            array_shift($argv);
+            @call_user_func_array($a, $argv);
+        }
+    }
+}
+$a = $argv;
+array_shift($a);
+run($a);
+?>
